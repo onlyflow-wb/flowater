@@ -1,17 +1,27 @@
 'use client'
 
 import { useEffect, useState, useCallback } from 'react'
+import { supabase } from '@/lib/supabase'
 import { Question } from '@/types'
 import { QuestionRenderer } from '@/components/surveys/QuestionRenderer'
 import { motion, AnimatePresence } from 'framer-motion'
-import { apiFetch } from '@/lib/api-client'
-import { generateUUID as createUUID } from '@/utils/uuid'
 import {
-  ArrowLeft, ArrowRight, CheckCircle, Plus, LogOut, Edit2, User,
-  ChevronRight, Trash2, AlertTriangle, KeyRound, Building2, Users,
+  ArrowLeft, ArrowRight, Plus, LogOut, Edit2, User,
+  ChevronRight, Trash2, AlertTriangle, KeyRound, Building2, Users, CheckCircle,
 } from 'lucide-react'
 
 // UUID polyfill — crypto.randomUUID() is undefined on some older Android browsers
+function generateUUID(): string {
+  if (typeof crypto !== 'undefined' && typeof (crypto as any).randomUUID === 'function') {
+    return (crypto as any).randomUUID()
+  }
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0
+    const v = c === 'x' ? r : (r & 0x3) | 0x8
+    return v.toString(16)
+  })
+}
+
 type AnswerValue = string | string[] | number
 
 interface HelperSession { id: string; username: string; display_name: string }
@@ -36,6 +46,7 @@ export default function HelperPage() {
 
   const [publicQuestions, setPublicQuestions] = useState<Question[]>([])
   const [b2bQuestions, setB2bQuestions] = useState<Question[]>([])
+  const [loadingQ, setLoadingQ] = useState(true)
 
   const [todayRespondents, setTodayRespondents] = useState<RespondentRecord[]>([])
   const [personalInfo, setPersonalInfo] = useState<PersonalInfo>(emptyInfo)
@@ -71,19 +82,19 @@ export default function HelperPage() {
 
   useEffect(() => {
     async function load() {
+      setLoadingQ(true)
       const [pub, b2b] = await Promise.all([
-        fetch('/api/public/questions?survey_type=public'),
-        fetch('/api/public/questions?survey_type=b2b'),
+        supabase.from('questions').select('*').eq('survey_type', 'public').eq('is_active', true).order('order_index', { ascending: true }),
+        supabase.from('questions').select('*').eq('survey_type', 'b2b').eq('is_active', true).order('order_index', { ascending: true }),
       ])
-      const pubData = await pub.json().catch(() => null)
-      const b2bData = await b2b.json().catch(() => null)
-      if (pub.ok) setPublicQuestions(pubData?.questions ?? [])
-      if (b2b.ok) setB2bQuestions(b2bData?.questions ?? [])
+      if (pub.data) setPublicQuestions(pub.data)
+      if (b2b.data) setB2bQuestions(b2b.data)
+      setLoadingQ(false)
     }
     load()
   }, [])
 
-  const loadTodayRespondents = useCallback(async () => {
+  const loadTodayRespondents = useCallback(async (_helperId: string) => {
     try {
       const res = await fetch('/api/helper/respondents')
       if (res.ok) {
@@ -94,11 +105,11 @@ export default function HelperPage() {
   }, [])
 
   useEffect(() => {
-    if (helper) loadTodayRespondents()
+    if (helper) loadTodayRespondents(helper.id)
   }, [helper, loadTodayRespondents])
 
   async function logout() {
-    await apiFetch('/api/helper/logout', { method: 'POST' }).catch(() => {})
+    await fetch('/api/helper/logout', { method: 'POST' }).catch(() => {})
     window.location.href = '/helper/login'
   }
 
@@ -108,7 +119,7 @@ export default function HelperPage() {
     if (pwNew !== pwConfirm) { setPwError('Passwords do not match'); return }
     setPwLoading(true)
     try {
-      const res = await apiFetch('/api/helper/change-password', {
+      const res = await fetch('/api/helper/change-password', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ current_password: pwCurrent, new_password: pwNew }),
@@ -135,40 +146,25 @@ export default function HelperPage() {
     if (!personalInfo.location.trim()) { setInfoError('Location is required.'); return }
 
     if (editingRespondent) {
-      const res = await apiFetch('/api/helper/respondents', {
-        method: 'PATCH',
-        body: JSON.stringify({
-        id: editingRespondent.id,
+      const { error } = await supabase.from('respondents').update({
         name: personalInfo.name.trim(), age: Number(personalInfo.age),
         gender: personalInfo.gender, location: personalInfo.location.trim(),
         phone: personalInfo.phone.trim() || null,
-        }),
-      })
-      if (!res.ok) {
-        const body = await res.json().catch(() => ({}))
-        setInfoError('Save failed: ' + (body.error ?? 'Please try again.'))
-        return
-      }
-      if (helper) loadTodayRespondents()
+      }).eq('id', editingRespondent.id)
+      if (error) { setInfoError('Save failed: ' + error.message); return }
+      if (helper) loadTodayRespondents(helper.id)
       setEditingRespondent(null); setPersonalInfo(emptyInfo); setView('list'); return
     }
 
-    const newSessionId = createUUID()
+    const newSessionId = generateUUID()
     setCurrentSessionId(newSessionId)
-    const res = await apiFetch('/api/helper/respondents', {
-      method: 'POST',
-      body: JSON.stringify({
+    const { error } = await supabase.from('respondents').insert({
       name: personalInfo.name.trim(), age: Number(personalInfo.age),
       gender: personalInfo.gender, location: personalInfo.location.trim(),
       phone: personalInfo.phone.trim() || null,
-      survey_type: 'helper', session_id: newSessionId,
-      }),
+      survey_type: 'helper', helper_id: helper?.id, session_id: newSessionId,
     })
-    if (!res.ok) {
-      const body = await res.json().catch(() => ({}))
-      setInfoError('Save failed: ' + (body.error ?? 'Please try again.'))
-      return
-    }
+    if (error) { setInfoError('Save failed: ' + error.message); return }
     setAnswers({}); setCurrentIndex(0); setView('survey')
   }
 
@@ -177,27 +173,20 @@ export default function HelperPage() {
     if (!businessInfo.business_name.trim()) { setBusinessError('Business name is required.'); return }
     if (!businessInfo.location.trim()) { setBusinessError('Location is required.'); return }
 
-    const newSessionId = createUUID()
+    const newSessionId = generateUUID()
     setCurrentSessionId(newSessionId)
 
     const fullName = businessInfo.contact_name.trim()
       ? `${businessInfo.business_name.trim()} — ${businessInfo.contact_name.trim()}`
       : businessInfo.business_name.trim()
 
-    const res = await apiFetch('/api/helper/respondents', {
-      method: 'POST',
-      body: JSON.stringify({
+    const { error } = await supabase.from('respondents').insert({
       name: fullName, age: 0, gender: 'Business',
       location: businessInfo.location.trim(),
       phone: businessInfo.phone.trim() || null,
-      survey_type: 'b2b', session_id: newSessionId,
-      }),
+      survey_type: 'b2b', helper_id: helper?.id, session_id: newSessionId,
     })
-    if (!res.ok) {
-      const body = await res.json().catch(() => ({}))
-      setBusinessError('Save failed: ' + (body.error ?? 'Please try again.'))
-      return
-    }
+    if (error) { setBusinessError('Save failed: ' + error.message); return }
     setAnswers({}); setCurrentIndex(0); setView('survey')
   }
 
@@ -211,14 +200,9 @@ export default function HelperPage() {
       answer_value: Array.isArray(answerValue) ? answerValue.join(',') : String(answerValue),
       survey_type: activeSurveyType,
     }))
-    if (responses.length > 0) {
-      await apiFetch('/api/public/responses', {
-        method: 'POST',
-        body: JSON.stringify({ responses }),
-      })
-    }
+    if (responses.length > 0) await supabase.from('responses').insert(responses)
     setSubmitting(false)
-    if (helper) loadTodayRespondents()
+    if (helper) loadTodayRespondents(helper.id)
     setView('success')
   }
 
@@ -227,7 +211,7 @@ export default function HelperPage() {
     setDeleting(true); setDeleteError('')
     try {
       const params = new URLSearchParams({ id: deleteTarget.id, session_id: deleteTarget.session_id })
-      const res = await apiFetch(`/api/helper/respondents?${params}`, { method: 'DELETE' })
+      const res = await fetch(`/api/helper/respondents?${params}`, { method: 'DELETE' })
       if (!res.ok) {
         const body = await res.json().catch(() => ({}))
         setDeleteError(body.error ?? 'Delete failed.'); setDeleting(false); return
@@ -295,7 +279,7 @@ export default function HelperPage() {
 
         {todayRespondents.length > 0 && (
           <div>
-            <h2 className="text-xs font-semibold text-white/30 uppercase tracking-wider mb-3">Today&apos;s Entries</h2>
+            <h2 className="text-xs font-semibold text-white/30 uppercase tracking-wider mb-3">Today's Entries</h2>
             <div className="space-y-2">
               {todayRespondents.map(r => {
                 const isBiz = r.survey_type === 'b2b' || r.gender === 'Business'
@@ -330,7 +314,7 @@ export default function HelperPage() {
           <div className="text-center py-12 text-white/20">
             <User className="w-12 h-12 mx-auto mb-3 opacity-30" />
             <p className="text-sm">No entries yet today</p>
-            <p className="text-xs mt-1">Tap Add New Entry to start</p>
+            <p className="text-xs mt-1">Tap "Add New Entry" to start</p>
           </div>
         )}
       </div>
